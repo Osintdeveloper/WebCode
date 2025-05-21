@@ -1,0 +1,35 @@
+
+  {
+    "key": "sample-property",
+    "title": "sample-property",
+    "path": "temp_orchestrator_test_mdn_root/yari/files/en-us/web/css/sample_prop.md",
+    "summary": "",
+    "keywords": [
+      "property",
+      "sample"
+    ]
+  },
+  {
+    "key": "SampleEl",
+    "title": "Sample Element",
+    "path": "temp_orchestrator_test_mdn_root/yari/files/en-us/web/html/sample_el.md",
+    "summary": "",
+    "keywords": [
+      "element",
+      "sample",
+      "sampleel"
+    ]
+  },
+  {
+    "key": "sample_term",
+    "title": "Sample Term",
+    "path": "temp_orchestrator_test_mdn_root/yari/files/en-us/glossary/sample_term.md",
+    "summary": "Definition of sample term.",
+    "keywords": [
+      "definition",
+      "glossary",
+      "sample",
+      "term"
+    ]
+  }
+]

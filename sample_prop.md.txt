@@ -1,0 +1,7 @@
+---
+title: sample-property
+slug: Web/CSS/sample-property
+page-type: css-property
+---
+# sample-property
+Description of sample-property.

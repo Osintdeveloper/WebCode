@@ -1,0 +1,30 @@
+
+  {
+    "path": "temp_orchestrator_test_mdn_root/yari/files/en-us/web/css/sample_prop.md",
+    "meta": {
+      "title": "sample-property",
+      "slug": "Web/CSS/sample-property",
+      "page-type": "css-property"
+    },
+    "tree": [
+      {
+        "type": "section",
+        "content": [
+          {
+            "type": "heading",
+            "level": 1,
+            "content": [
+              "sample-property"
+            ]
+          },
+          {
+            "type": "paragraph",
+            "content": [
+              "Description of sample-property."
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

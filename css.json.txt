@@ -1,0 +1,1 @@
+{"properties": {"sample-property": {"__compat": {"mdn_url": "/docs/Web/CSS/sample-property", "support": {"firefox": {"version_added": "70"}}}}}}

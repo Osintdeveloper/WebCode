@@ -1,0 +1,151 @@
+{
+  "cssxref": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "linkTextArgIndex": 1,
+    "categoryHint": "css"
+  },
+  "SVGElement": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "svg"
+  },
+  "HTMLElement": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "html"
+  },
+  "MathMLElement": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "mathml"
+  },
+  "HTTPHeader": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "http"
+  },
+  "APIRef": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "api"
+  },
+  "DOMxRef": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "linkTextArgIndex": 1,
+    "categoryHint": "api"
+  },
+  "JSxRef": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "linkTextArgIndex": 1,
+    "categoryHint": "javascript"
+  },
+  "Glossary": {
+    "renderType": "link_to_feature",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "glossary"
+  },
+  "Interwiki": {
+    "renderType": "external_link_interwiki",
+    "featureKeyArgIndex": 0
+  },
+  "EmbedLiveSample": {
+    "renderType": "embed_iframe_livesample",
+    "sampleIdArgIndex": 0,
+    "iframeHeight": "400px",
+    "iframeWidth": "100%"
+  },
+  "EmbedInteractiveExample": {
+    "renderType": "embed_iframe_interactive",
+    "exampleIdArgIndex": 0,
+    "iframeHeight": "600px"
+  },
+  "EmbedYouTube": {
+    "renderType": "embed_youtube_video",
+    "videoIdArgIndex": 0
+  },
+  "BCD": {
+    "renderType": "display_bcd_inline",
+    "featureKeyArgIndex": 0,
+    "categoryHint": "bcd"
+  },
+  "SeeCompatTable": {
+    "renderType": "display_bcd_link_to_table",
+    "featureKeyArgIndex": 0,
+    "text": "View compatibility data"
+  },
+  "OptionalInline": {
+    "renderType": "styled_text_notice",
+    "style": "optional",
+    "textArgIndex": 0
+  },
+  "ReadOnlyInline": {
+    "renderType": "styled_text_notice",
+    "style": "read-only",
+    "textArgIndex": 0
+  },
+  "NonStandard": {
+    "renderType": "notice_banner",
+    "type": "non-standard",
+    "messageFromArgs": true
+  },
+  "Deprecated": {
+    "renderType": "notice_banner",
+    "type": "deprecated",
+    "messageFromArgs": true
+  },
+  "Experimental": {
+    "renderType": "notice_banner",
+    "type": "experimental",
+    "messageFromArgs": true
+  },
+  "NeedsPrivilege": {
+    "renderType": "notice_banner",
+    "type": "privileged",
+    "messageFromArgs": true
+  },
+  "ListSubpages": {
+    "renderType": "list_subpages_auto",
+    "pathArgIndex": 0,
+    "depthArgIndex": 1
+  },
+  "LandingPageListSubpages": {
+    "renderType": "list_subpages_landing",
+    "groupdepthArgIndex": 0
+  },
+  "Specifications": {
+    "renderType": "display_spec_table",
+    "featureKeyArgIndex": 0
+  },
+  "RFC": {
+    "renderType": "external_link_rfc",
+    "rfcNumberArgIndex": 0
+  },
+  "ISOAbbr": {
+    "renderType": "text_with_tooltip",
+    "abbrArgIndex": 0,
+    "definitionArgIndex": 1
+  },
+  "AvailableInWorkers": {
+    "renderType": "notice_inline",
+    "type": "available-in-workers"
+  },
+  "SecureContextRequired": {
+    "renderType": "notice_inline",
+    "type": "secure-context-required"
+  },
+  "QuickLinksWithSubpages": {
+    "renderType": "quicklinks_subpages"
+  },
+  "PreviousMenu": {
+    "renderType": "navigation_menu_prev"
+  },
+  "NextMenu": {
+    "renderType": "navigation_menu_next"
+  },
+  "MDNSidebar": {
+    "renderType": "mdn_sidebar_embed"
+  }
+}

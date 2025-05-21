@@ -1,0 +1,22 @@
+{
+  "sample-property": {
+    "mdn_url": "/docs/Web/CSS/sample-property",
+    "spec_url": null,
+    "support": {
+      "firefox": {
+        "version_added": "70"
+      }
+    },
+    "status": null
+  },
+  "SampleAPI": {
+    "mdn_url": "/docs/Web/API/SampleAPI",
+    "spec_url": null,
+    "support": {
+      "chrome": {
+        "version_added": "80"
+      }
+    },
+    "status": null
+  }
+}

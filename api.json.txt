@@ -1,0 +1,1 @@
+{"SampleAPI": {"__compat": {"mdn_url": "/docs/Web/API/SampleAPI", "support": {"chrome": {"version_added": "80"}}}}}

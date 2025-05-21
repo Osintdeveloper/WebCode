@@ -1,0 +1,7 @@
+---
+title: Sample Element
+slug: Web/HTML/Element/SampleEl
+page-type: html-element
+---
+# Sample Element
+Content about {{HTMLElement('SampleEl')}}.

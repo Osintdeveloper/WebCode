@@ -1,0 +1,30 @@
+
+  {
+    "path": "temp_orchestrator_test_mdn_root/yari/files/en-us/web/html/sample_el.md",
+    "meta": {
+      "title": "Sample Element",
+      "slug": "Web/HTML/Element/SampleEl",
+      "page-type": "html-element"
+    },
+    "tree": [
+      {
+        "type": "section",
+        "content": [
+          {
+            "type": "heading",
+            "level": 1,
+            "content": [
+              "Sample Element"
+            ]
+          },
+          {
+            "type": "paragraph",
+            "content": [
+              "Content about {{HTMLElement('SampleEl')}}."
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]

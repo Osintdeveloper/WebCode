@@ -1,0 +1,30 @@
+
+  "sample-property": {
+    "primaryDocPath": "temp_orchestrator_test_mdn_root/yari/files/en-us/web/css/sample_prop.md",
+    "titles": [
+      "sample-property"
+    ],
+    "macrosOnPage": [],
+    "bcdPath": "sample-property",
+    "relatedDocPaths": {},
+    "usedInPaths": []
+  },
+  "SampleEl": {
+    "primaryDocPath": "temp_orchestrator_test_mdn_root/yari/files/en-us/web/html/sample_el.md",
+    "titles": [
+      "Sample Element"
+    ],
+    "macrosOnPage": [],
+    "relatedDocPaths": {},
+    "usedInPaths": []
+  },
+  "sample_term": {
+    "primaryDocPath": "temp_orchestrator_test_mdn_root/yari/files/en-us/glossary/sample_term.md",
+    "titles": [
+      "Sample Term"
+    ],
+    "macrosOnPage": [],
+    "relatedDocPaths": {},
+    "usedInPaths": []
+  }
+}

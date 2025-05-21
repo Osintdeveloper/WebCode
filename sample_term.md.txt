@@ -1,0 +1,6 @@
+---
+title: Sample Term
+slug: Glossary/Sample_Term
+page-type: glossary-definition
+---
+Definition of sample term.

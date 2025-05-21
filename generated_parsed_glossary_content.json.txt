@@ -1,0 +1,18 @@
+[
+  {
+    "path": "temp_orchestrator_test_mdn_root/yari/files/en-us/glossary/sample_term.md",
+    "meta": {
+      "title": "Sample Term",
+      "slug": "Glossary/Sample_Term",
+      "page-type": "glossary-definition"
+    },
+    "tree": [
+      {
+        "type": "paragraph",
+        "content": [
+          "Definition of sample term."
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,1120 @@
+# mdn_data_processor.py
+import yaml
+import markdown # Or from markdown import Markdown if preferred for extension management
+import re # For macro parsing initially
+from bs4 import BeautifulSoup
+import os
+import json
+import shutil # For cleaning up test directories
+
+# --- Output JSON Schemas (as defined in comments in the original script) ---
+# 1. Parsed Page Content JSON (e.g., generated_parsed_html_content.json)
+# 2. Relationship Map JSON (e.g., generated_feature_relation_map.json)
+# 3. Search Index JSON (e.g., generated_search_index.json)
+# 4. Template/Macro Resolver Map JSON (e.g., generated_macro_resolver_map.json)
+# 5. Processed Browser Compatibility Data JSON (e.g., generated_bcd_processed.json)
+
+# --- Markdown Parsing Logic ---
+
+def _parse_frontmatter(markdown_content_string):
+    """
+    Parses YAML frontmatter from the beginning of a Markdown string.
+    Returns a tuple: (frontmatter_dict, content_without_frontmatter_string)
+    Returns ({}, original_content_string) if no frontmatter is found or on error.
+    """
+    if not markdown_content_string.startswith("---"):
+        return {}, markdown_content_string
+
+    try:
+        end_frontmatter = markdown_content_string.find("---", 3)
+        if end_frontmatter == -1:
+            # No closing '---', so not valid frontmatter by this simple check
+            return {}, markdown_content_string
+
+        frontmatter_str = markdown_content_string[3:end_frontmatter].strip()
+        content_str = markdown_content_string[end_frontmatter+3:].lstrip('\r\n')
+        
+        if not frontmatter_str: 
+            return {}, content_str # Empty frontmatter block
+
+        frontmatter = yaml.safe_load(frontmatter_str)
+        if not isinstance(frontmatter, dict):
+            print(f"Warning: Frontmatter parsed but is not a dictionary. Content: '{frontmatter_str[:50]}...'")
+            return {}, markdown_content_string # Treat as no valid frontmatter
+        return frontmatter, content_str
+    except yaml.YAMLError as e:
+        print(f"Error parsing YAML frontmatter: {e}. Content: '{markdown_content_string[:100]}...'")
+        return {}, markdown_content_string # Error, treat as no frontmatter
+
+def _extract_mdn_macros(text_content):
+    """
+    Finds MDN macros (e.g., {{MacroName("arg1", "arg2")}}) in a string.
+    Returns a list of macro objects.
+    """
+    macros_found = []
+    pattern = r"\{\{([\w\d_:\-\.]+)\s*\((.*?)\)\s*\}\}" # Allow . and - in macro names
+    
+    for match in re.finditer(pattern, text_content):
+        macro_name = match.group(1)
+        args_str = match.group(2).strip()
+        
+        args = []
+        if args_str:
+            current_arg = ""
+            in_quote = False
+            quote_char = ''
+            escape_next = False
+            
+            for char_idx, char in enumerate(args_str):
+                if escape_next:
+                    current_arg += char
+                    escape_next = False
+                    continue
+                
+                if char == '\\':
+                    escape_next = True
+                    # Preserve backslash if it's not escaping a quote relevant to parsing
+                    # This simple parser might not perfectly handle all escaped chars within args.
+                    # For now, we consume it if it's before a quote, otherwise it might become part of current_arg.
+                    if char_idx + 1 < len(args_str) and args_str[char_idx+1] in "\"\'":
+                        # It's escaping a quote, let the quote handler deal with it.
+                        # The backslash itself isn't added to current_arg here.
+                        pass
+                    else: # Not escaping a quote for parsing purposes, add it.
+                        current_arg += char
+                    continue
+
+
+                if in_quote:
+                    if char == quote_char:
+                        in_quote = False
+                    current_arg += char # Keep quotes as part of the argument for now
+                else:
+                    if char in "\"\'":
+                        in_quote = True
+                        quote_char = char
+                        current_arg += char
+                    elif char == ',':
+                        args.append(current_arg.strip())
+                        current_arg = ""
+                    else:
+                        current_arg += char
+            
+            args.append(current_arg.strip())
+
+            cleaned_args = []
+            for arg in args:
+                if (arg.startswith("'") and arg.endswith("'")) or \
+                   (arg.startswith('"') and arg.endswith('"')):
+                    cleaned_args.append(arg[1:-1])
+                else:
+                    cleaned_args.append(arg)
+            args = cleaned_args
+
+        macros_found.append({"type": "mdn_macro", "name": macro_name, "args": args})
+    return macros_found
+
+def _is_macro_exact_match(text_segment, parsed_macro_dict):
+    if not parsed_macro_dict or parsed_macro_dict.get("type") != "mdn_macro":
+        return False
+    name = parsed_macro_dict["name"]
+    args = parsed_macro_dict["args"]
+    
+    reconstructed_args = []
+    for arg in args:
+        # Simple quoting for reconstruction: if arg contains comma or needs quotes
+        if ',' in arg or '"' in arg or "'" in arg or not arg.strip() or ' ' in arg :
+             # Prefer double quotes, escape internal double quotes
+            arg_str_escaped = arg.replace('"', '\\"') 
+            reconstructed_args.append('"' + arg_str_escaped + '"')
+        else:
+            reconstructed_args.append(arg)
+    
+    reconstructed = f"{{{{{name}({', '.join(reconstructed_args)})}}}}"
+    
+    # Normalize spaces for comparison (very basic normalization)
+    norm_text = re.sub(r'\s+', ' ', text_segment).strip()
+    norm_reconstructed = re.sub(r'\s+', ' ', reconstructed).strip()
+    # More specific normalization around parens and commas
+    norm_text = re.sub(r'\s*\(\s*', '(', norm_text)
+    norm_text = re.sub(r'\s*\)\s*', ')', norm_text)
+    norm_text = re.sub(r'\s*,\s*', ',', norm_text)
+    norm_reconstructed = re.sub(r'\s*\(\s*', '(', norm_reconstructed)
+    norm_reconstructed = re.sub(r'\s*\)\s*', ')', norm_reconstructed)
+    norm_reconstructed = re.sub(r'\s*,\s*', ',', norm_reconstructed)
+
+    return norm_text == norm_reconstructed
+
+def _process_inline_content(element_or_text_node):
+    if isinstance(element_or_text_node, str):
+        text_content = element_or_text_node
+        if not text_content: return []
+        parts = []
+        current_pos = 0
+        for match in re.finditer(r"\{\{.*?\}\}", text_content, re.DOTALL): # DOTALL important for multiline macros
+            macro_start, macro_end = match.span()
+            if macro_start > current_pos:
+                parts.append(text_content[current_pos:macro_start])
+            potential_macro_str = text_content[macro_start:macro_end]
+            extracted_macros = _extract_mdn_macros(potential_macro_str)
+            if len(extracted_macros) == 1 and _is_macro_exact_match(potential_macro_str, extracted_macros[0]):
+                parts.append(extracted_macros[0])
+            else:
+                parts.append(potential_macro_str) 
+            current_pos = macro_end
+        if current_pos < len(text_content):
+            parts.append(text_content[current_pos:])
+        return [part for part in parts if part]
+
+    if not hasattr(element_or_text_node, 'name') or not element_or_text_node.name: # NavigableString
+        return _process_inline_content(element_or_text_node.string or "")
+
+    tag_name = element_or_text_node.name.lower()
+    content_accumulator = []
+    for child in element_or_text_node.contents:
+        processed_child_content = []
+        if hasattr(child, 'name') and child.name: # Child is a tag
+            child_tag_name = child.name.lower()
+            if child_tag_name in ['strong', 'b']:
+                processed_child_content = [{"type": "inline_bold", "content": _process_inline_content(child)}]
+            elif child_tag_name in ['em', 'i']:
+                processed_child_content = [{"type": "inline_italic", "content": _process_inline_content(child)}]
+            elif child_tag_name == 'code':
+                processed_child_content = [{"type": "inline_code", "content": child.get_text()}] # Keep as text
+            elif child_tag_name == 'a':
+                processed_child_content = [{"type": "inline_link", "href": child.get('href', ''), "content": _process_inline_content(child)}]
+            elif child_tag_name == 'br':
+                processed_child_content = [{"type": "line_break"}]
+            elif child_tag_name == 'img':
+                 processed_child_content = [{"type": "image", "src": child.get('src', ''), "alt": child.get('alt', '')}]
+            elif child_tag_name == 'span' or child_tag_name == 'kbd': # Pass through content of span/kbd
+                processed_child_content = _process_inline_content(child)
+            else: # Unknown inline or unexpected block tag
+                processed_child_content = _process_inline_content(child.get_text()) # Fallback to text
+        else: # Child is a NavigableString
+            processed_child_content = _process_inline_content(child.string or "")
+
+        if isinstance(processed_child_content, list):
+            content_accumulator.extend(processed_child_content)
+        elif processed_child_content:
+            content_accumulator.append(processed_child_content)
+    
+    final_content = []
+    for part in content_accumulator:
+        if isinstance(part, str) and final_content and isinstance(final_content[-1], str):
+            final_content[-1] += part
+        elif part: 
+            if not (isinstance(part, str) and not part.strip()): # Avoid adding empty/whitespace strings unless they are meaningful
+                 final_content.append(part)
+    return final_content
+
+def _get_code_language(bs_code_element):
+    if bs_code_element.get('class'):
+        for class_name in bs_code_element.get('class'):
+            if class_name.startswith('language-'):
+                return class_name.replace('language-', '')
+    # Fallback for common but non-standard class names if markdown lib produces them
+    if bs_code_element.get('class') and len(bs_code_element.get('class')) == 1:
+        lang_candidate = bs_code_element.get('class')[0]
+        # Check if it's a common language name not prefixed by 'language-'
+        if lang_candidate in ['html', 'css', 'javascript', 'js', 'python', 'json', 'xml', 'bash', 'shell']:
+            return lang_candidate
+    return None
+
+def _convert_html_element_to_node(element):
+    node = None
+    if not hasattr(element, 'name') or element.name is None: # NavigableString (text node)
+        if element.string and element.string.strip(): # Only process if it's not just whitespace
+            # Text nodes at block level become paragraphs, or are part of inline processing
+            # This function is for block elements. If a raw string is here, it's likely an error
+            # or needs to be wrapped. For now, let's assume it becomes a paragraph if it's significant.
+            # However, _process_inline_content should handle text within known tags.
+            # If a text node is a direct child of the soup, it implies paragraph.
+            processed_text = _process_inline_content(element.string)
+            if processed_text: # Ensure it's not empty after processing
+                return {"type": "paragraph", "content": processed_text}
+        return None
+
+    tag_name = element.name.lower()
+    
+    if tag_name in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+        node = {"type": "heading", "level": int(tag_name[1]), "content": _process_inline_content(element)}
+    elif tag_name == 'p':
+        processed_content = _process_inline_content(element)
+        if len(processed_content) == 1 and isinstance(processed_content[0], dict) and processed_content[0].get("type") == "mdn_macro":
+            return processed_content[0] # Hoist block macro
+        node = {"type": "paragraph", "content": processed_content}
+    elif tag_name in ['ul', 'ol']:
+        items = []
+        for child_li in element.find_all('li', recursive=False):
+            # Content of <li> can be complex, so process it fully
+            li_node_content = []
+            for content_child in child_li.contents: # Process all children of <li>
+                converted_li_child = _convert_html_element_to_node(content_child) # Try block conversion
+                if converted_li_child:
+                    if isinstance(converted_li_child, list): # from _process_inline_content on text
+                        li_node_content.extend(converted_li_child)
+                    else:
+                        li_node_content.append(converted_li_child)
+                elif isinstance(content_child, str) and content_child.strip(): # Text node not converted to block
+                    li_node_content.extend(_process_inline_content(content_child))
+
+            if li_node_content: # Only add if there's actual content
+                # If li_node_content is just a single paragraph node, unwrap it for simpler lists
+                if len(li_node_content) == 1 and isinstance(li_node_content[0], dict) and li_node_content[0].get("type") == "paragraph":
+                    items.append(li_node_content[0]['content']) # Add the content of the paragraph
+                else:
+                    items.append(li_node_content) # Add as potentially complex content
+        node = {"type": "list", "ordered": tag_name == 'ol', "items": items}
+
+    elif tag_name == 'pre':
+        code_element = element.find('code')
+        code_text = ""
+        lang = None
+        if code_element:
+            code_text = code_element.get_text(strip=False) # Get raw text, don't strip leading/trailing newlines from code
+            lang = _get_code_language(code_element)
+        else: 
+            code_text = element.get_text(strip=False)
+        node = {"type": "code_block", "language": lang, "code_content": code_text}
+    elif tag_name == 'blockquote':
+        # For blockquotes, process all children as they might be paragraphs, lists, etc.
+        children_nodes = []
+        for child in element.children:
+            converted_child = _convert_html_element_to_node(child)
+            if converted_child:
+                if isinstance(converted_child, list): children_nodes.extend(converted_child)
+                else: children_nodes.append(converted_child)
+        node = {"type": "blockquote", "content": children_nodes} # Content is a list of block nodes
+    elif tag_name == 'table':
+        headers = []
+        rows_data = []
+        thead = element.find('thead')
+        if thead:
+            header_row = thead.find('tr')
+            if header_row:
+                for th in header_row.find_all(['th', 'td']): # Headers can be th or td
+                    headers.append(_process_inline_content(th))
+        
+        tbody = element.find('tbody')
+        if tbody:
+            for tr_idx, tr in enumerate(tbody.find_all('tr', recursive=False)):
+                row_cells = []
+                for td_idx, td in enumerate(tr.find_all(['td', 'th'], recursive=False)):
+                    row_cells.append(_process_inline_content(td))
+                rows_data.append(row_cells)
+        # If no thead but tbody has a first row that looks like headers (all th)
+        # This is a heuristic and might not always be correct.
+        elif not headers and rows_data and element.find('th'): # Check if any th exists in table
+             is_first_row_header = False
+             first_tr = element.find('tr')
+             if first_tr:
+                 is_first_row_header = all(cell.name == 'th' for cell in first_tr.find_all(recursive=False))
+             if is_first_row_header and rows_data: # Assuming rows_data was populated from all trs
+                 headers = rows_data.pop(0) # First row becomes headers
+
+        node = {"type": "table", "headers": headers, "rows": rows_data}
+    elif tag_name == 'hr':
+        node = {"type": "horizontal_rule"}
+    elif tag_name == 'dl': # Definition List
+        items = []
+        for child in element.children:
+            if hasattr(child, 'name'):
+                if child.name == 'dt':
+                    items.append({"type": "definition_term", "content": _process_inline_content(child)})
+                elif child.name == 'dd':
+                    # Process dd content, which can be block-level
+                    dd_children_nodes = []
+                    for dd_child_element in child.children:
+                        converted_dd_child = _convert_html_element_to_node(dd_child_element)
+                        if converted_dd_child:
+                            if isinstance(converted_dd_child, list): dd_children_nodes.extend(converted_dd_child)
+                            else: dd_children_nodes.append(converted_dd_child)
+                    items.append({"type": "definition_description", "content": dd_children_nodes})
+        if items:
+            node = {"type": "definition_list", "items": items}
+    
+    elif tag_name in ['div', 'article', 'aside', 'details', 'summary', 'figure', 'figcaption', 'main', 'nav', 'header', 'footer', 'address']: # Generic block containers
+        children_nodes = []
+        for child_el in element.children:
+            converted_child = _convert_html_element_to_node(child_el)
+            if converted_child:
+                if isinstance(converted_child, list): children_nodes.extend(converted_child)
+                else: children_nodes.append(converted_child)
+        
+        if children_nodes: # Only create node if there's content
+            node = {
+                "type": "section", # Using "section" as a generic block container type
+                "tag_hint": tag_name, # Keep original tag as a hint
+                "attributes": dict(element.attrs) if element.attrs else None,
+                "content": children_nodes
+            }
+            if not node["attributes"]: del node["attributes"]
+        # For 'details' and 'summary', we might want a more specific structure if needed by renderer
+        if tag_name == 'details' and node: node['type'] = 'details_container'
+        if tag_name == 'summary' and node: node['type'] = 'summary_element' # Content is its children
+
+    # If node is still None, it means it's an unhandled block tag or an inline tag at block level
+    # or an empty tag. We generally ignore these unless they were text processed into a paragraph.
+    if node and not node.get("content") and not (node.get("type") == "horizontal_rule"): # Check if content is empty
+        # For types like 'list', content is in 'items'. For 'table', in 'rows'/'headers'.
+        if node.get("type") == "list" and not node.get("items"): return None
+        if node.get("type") == "table" and not node.get("rows") and not node.get("headers"): return None
+        if node.get("type") not in ["horizontal_rule", "list", "table"] and not node.get("content"): # General check for other types
+             # This might remove empty sections, which could be intended (e.g. <section></section>)
+             # print(f"Warning: Node of type {node.get('type')} has no content, dropping: {element.name}")
+             # return None # Decide whether to keep empty structural nodes
+             pass
+
+
+    return node
+
+def _parse_markdown_body_to_tree(markdown_text):
+    if not markdown_text.strip():
+        return []
+    html_output = markdown.markdown(
+        markdown_text, 
+        extensions=['extra', 'tables', 'fenced_code', 'toc', 'nl2br', 'sane_lists'] # Added nl2br, sane_lists
+    )
+    soup = BeautifulSoup(html_output, 'lxml')
+    parsed_nodes = []
+    for element in soup.contents:
+        converted_node = _convert_html_element_to_node(element)
+        if converted_node:
+            if isinstance(converted_node, list): # From _process_inline_content on a root text node
+                parsed_nodes.extend(node for node in converted_node if node) # Filter None from list
+            else:
+                parsed_nodes.append(converted_node)
+    return [node for node in parsed_nodes if node and (not isinstance(node, str) or node.strip())]
+
+def parse_markdown_file(file_path):
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            full_content = f.read()
+    except FileNotFoundError:
+        print(f"Error: File not found {file_path}")
+        return None
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        return None
+
+    frontmatter, body_markdown = _parse_frontmatter(full_content)
+    if 'title' not in frontmatter and body_markdown.strip(): # Try to get H1 if no title
+        first_heading_match = re.search(r"^#\s+(.*)", body_markdown, re.MULTILINE)
+        if first_heading_match:
+            frontmatter['title'] = first_heading_match.group(1).strip()
+        elif 'slug' in frontmatter: # Fallback title from slug
+             frontmatter['title'] = frontmatter['slug'].split('/')[-1].replace('_', ' ').replace('-', ' ').title()
+
+
+    page_object = {
+        "path": file_path.replace(os.sep, '/'), # Normalize path separators
+        "meta": frontmatter,
+        "tree": _parse_markdown_body_to_tree(body_markdown)
+    }
+    return page_object
+
+# --- Sidebar/Navigation Processing Logic ---
+def _traverse_sidebar_items(items, current_category_path, sidebar_file):
+    extracted_entries = []
+    if not isinstance(items, list): return []
+    for item in items:
+        if not isinstance(item, dict): continue
+        title = item.get('title')
+        path_or_slug = item.get('path', item.get('slug'))
+        entry = {"title": title, "path": path_or_slug, "category_path": current_category_path, "sidebar_file": sidebar_file}
+        extracted_entries.append(entry)
+        if 'children' in item and isinstance(item['children'], list):
+            new_category_path = current_category_path + [title] if title else current_category_path
+            extracted_entries.extend(_traverse_sidebar_items(item['children'], new_category_path, sidebar_file))
+    return extracted_entries
+
+def load_and_extract_sidebar_data(sidebars_base_path):
+    parsed_sidebars = {}
+    if not os.path.exists(sidebars_base_path):
+        print(f"Warning: Sidebars base path not found: {sidebars_base_path}")
+        return []
+    try:
+        for filename in os.listdir(sidebars_base_path):
+            if filename.endswith((".yaml", ".yml")):
+                sidebar_name = filename.split('.')[0]
+                file_path = os.path.join(sidebars_base_path, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        parsed_sidebars[sidebar_name] = yaml.safe_load(f)
+                except Exception as e:
+                    print(f"Warning: Could not parse/read sidebar file {file_path}: {e}")
+    except Exception as e:
+        print(f"Error listing sidebar files in {sidebars_base_path}: {e}")
+        return []
+
+    all_navigation_entries = []
+    for sidebar_name, sidebar_content in parsed_sidebars.items():
+        if not sidebar_content: continue
+        root_items = None
+        if isinstance(sidebar_content, list): root_items = sidebar_content
+        elif isinstance(sidebar_content, dict):
+            if 'items' in sidebar_content and isinstance(sidebar_content['items'], list):
+                root_items = sidebar_content['items']
+            else:
+                list_valued_keys = [k for k, v in sidebar_content.items() if isinstance(v, list)]
+                if len(list_valued_keys) == 1: root_items = sidebar_content[list_valued_keys[0]]
+        if root_items:
+            all_navigation_entries.extend(_traverse_sidebar_items(root_items, [sidebar_name], sidebar_name)) # Use sidebar_name as root category
+    return all_navigation_entries
+
+# --- Parsed Page Content JSON Generation ---
+def find_markdown_files(content_base_path):
+    markdown_files = []
+    for root, _, files in os.walk(content_base_path):
+        for file in files:
+            if file.endswith(".md"):
+                markdown_files.append(os.path.join(root, file).replace(os.sep, '/')) # Normalize path
+    return markdown_files
+
+def categorize_markdown_file(file_path, frontmatter):
+    path_lower = file_path.lower()
+    page_type = frontmatter.get('page-type', '').lower()
+    if page_type:
+        if 'html' in page_type: return 'html'
+        if 'css' in page_type: return 'css'
+        if 'javascript' in page_type or 'js' in page_type : return 'javascript'
+        if 'webapi' in page_type or 'api' in page_type: return 'api'
+    if 'web/' in path_lower:
+        relevant_path_segment = path_lower.split('web/', 1)[-1]
+        if relevant_path_segment.startswith('html/'): return 'html'
+        if relevant_path_segment.startswith('css/'): return 'css'
+        if relevant_path_segment.startswith('javascript/'): return 'javascript'
+        if relevant_path_segment.startswith('api/'): return 'api'
+    if 'glossary/' in path_lower: return 'glossary'
+    return "other"
+
+def generate_parsed_content_json(content_repo_base_path, output_dir):
+    search_paths = [os.path.join(content_repo_base_path, "web"), os.path.join(content_repo_base_path, "glossary")]
+    all_md_files = []
+    for path in search_paths:
+        if os.path.exists(path): all_md_files.extend(find_markdown_files(path))
+    if not all_md_files:
+        print(f"Warning: No Markdown files found in {content_repo_base_path}")
+        return {}
+    categorized_pages = {}
+    for md_file_path in all_md_files:
+        page_object = parse_markdown_file(md_file_path) 
+        if page_object:
+            category = categorize_markdown_file(md_file_path, page_object['meta'])
+            categorized_pages.setdefault(category, []).append(page_object)
+    os.makedirs(output_dir, exist_ok=True)
+    for category, pages in categorized_pages.items():
+        output_filename = os.path.join(output_dir, f"generated_parsed_{category}_content.json")
+        try:
+            with open(output_filename, 'w', encoding='utf-8') as f:
+                json.dump(pages, f, indent=2, ensure_ascii=False)
+            print(f"Successfully wrote {len(pages)} pages to {output_filename}")
+        except Exception as e:
+            print(f"Error writing JSON to {output_filename}: {e}")
+    return categorized_pages
+
+# --- BCD Processing Logic ---
+def _normalize_bcd_key(bcd_path_parts, category):
+    if not bcd_path_parts: return None
+    key_candidate = ""
+    if category == 'css':
+        if bcd_path_parts[0] in ['properties', 'selectors', 'types', 'at-rules']: # Added at-rules
+            key_candidate = bcd_path_parts[-1]
+            if bcd_path_parts[0] == 'types' and len(bcd_path_parts) > 1: # e.g. css.types.length.px -> length.px
+                key_candidate = ".".join(bcd_path_parts[1:])
+
+    elif category == 'javascript' and bcd_path_parts[0] == 'builtins':
+        if len(bcd_path_parts) == 2: key_candidate = bcd_path_parts[1] 
+        elif len(bcd_path_parts) > 2:
+            class_name = bcd_path_parts[1]
+            # Reconstruct path more carefully, looking for 'prototype'
+            if 'prototype' in bcd_path_parts:
+                proto_index = bcd_path_parts.index('prototype')
+                key_candidate = f"{class_name}.{'.'.join(bcd_path_parts[proto_index:])}"
+            else: # Static member or direct property
+                key_candidate = f"{class_name}.{'.'.join(bcd_path_parts[2:])}"
+    elif category == 'api':
+        key_candidate = ".".join(bcd_path_parts)
+    elif category == 'html' and bcd_path_parts[0] == 'elements':
+        key_candidate = ".".join(bcd_path_parts[1:]) # e.g. a or a.href
+    
+    if not key_candidate: # Fallback
+        key_candidate = ".".join(bcd_path_parts)
+    
+    return key_candidate.lower().replace('_', '-') # General normalization
+
+def _traverse_bcd_node(data_node, current_path_parts, category, processed_bcd):
+    if isinstance(data_node, dict):
+        for key, value in data_node.items():
+            if key == '__compat' and isinstance(value, dict):
+                feature_key = _normalize_bcd_key(current_path_parts, category)
+                if feature_key and feature_key not in processed_bcd:
+                    processed_bcd[feature_key] = {
+                        "mdn_url": value.get("mdn_url"), "spec_url": value.get("spec_url"),
+                        "support": value.get("support"), "status": value.get("status")}
+            elif key != '__compat' and isinstance(value, dict):
+                _traverse_bcd_node(value, current_path_parts + [key], category, processed_bcd)
+
+def load_and_process_bcd_data(bcd_base_path, output_dir):
+    raw_bcd_data_by_category = {}
+    if not os.path.exists(bcd_base_path):
+        print(f"Error: BCD base path not found: {bcd_base_path}")
+        return {}
+    try:
+        for filename in os.listdir(bcd_base_path):
+            if filename.endswith(".json"):
+                category = filename.replace(".json", "")
+                file_path = os.path.join(bcd_base_path, filename)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        raw_bcd_data_by_category[category] = json.load(f)
+                except Exception as e: print(f"Warning: Could not parse/read BCD file {file_path}: {e}")
+    except Exception as e: print(f"Error listing BCD files in {bcd_base_path}: {e}"); return {}
+
+    processed_bcd = {}
+    for category, data_tree in raw_bcd_data_by_category.items():
+        if isinstance(data_tree, dict):
+            for top_level_feature, content in data_tree.items():
+                if isinstance(content, dict):
+                     _traverse_bcd_node(content, [top_level_feature], category, processed_bcd)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, "generated_bcd_processed.json")
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            json.dump(processed_bcd, f, indent=2, ensure_ascii=False)
+        print(f"Successfully wrote processed BCD to {output_filename}")
+    except Exception as e:
+        print(f"Error writing processed BCD to {output_filename}: {e}")
+    return processed_bcd
+
+# --- Relationship Map Generation ---
+def _normalize_page_slug_to_feature_key(slug, page_type=None, file_path=""):
+    if not slug: return None
+    slug = slug.strip('/').lower() # Normalize to lowercase early
+    parts = slug.split('/')
+    if parts and parts[0] == 'web': parts.pop(0)
+    if not parts: return None
+
+    category_guess = parts[0]
+    
+    # Try to derive a key similar to BCD keys for better matching
+    if category_guess == 'glossary' and len(parts) > 1: return parts[1].replace('_', '-')
+    if category_guess == 'css':
+        # css/properties/color -> color, css/selectors/:hover -> :hover, css/css_grid_layout -> css_grid_layout (guide)
+        # This needs to be more specific to match BCD's css.properties.color -> color
+        if len(parts) > 1 and parts[-1] != category_guess : return parts[-1].replace('_', '-')
+    if category_guess == 'javascript':
+        if 'reference/global_objects' in slug and len(parts) >= 3: # web/javascript/reference/global_objects/array/map
+            class_name_idx = parts.index('global_objects') + 1
+            if class_name_idx < len(parts):
+                class_name = parts[class_name_idx]
+                if class_name_idx + 1 < len(parts): # Method or property
+                    member_name = parts[class_name_idx + 1]
+                    # Check for prototype in path parts after class_name
+                    if 'prototype' in parts[class_name_idx+1 :]:
+                         proto_idx_rel = parts[class_name_idx+1 :].index('prototype')
+                         actual_member_name = parts[class_name_idx + 1 + proto_idx_rel + 1] if class_name_idx + 1 + proto_idx_rel + 1 < len(parts) else None
+                         if actual_member_name: return f"{class_name}.prototype.{actual_member_name}".lower()
+                         else: return f"{class_name}.prototype".lower() # e.g. Array.prototype
+                    return f"{class_name}.{member_name}".lower()
+                return class_name.lower() # Just the class/global object
+    if category_guess == 'api': # Web/API/Document/body -> document.body
+        if len(parts) > 1: return ".".join(parts[1:]).lower()
+        return parts[0].lower() # e.g. Web/API/Fetch_API -> fetch_api (guide)
+    if category_guess == 'html': # Web/HTML/Element/a -> a, Web/HTML/Global_Attributes/id -> id
+        if 'element' in parts and parts.index('element') + 1 < len(parts):
+            el_name = parts[parts.index('element') + 1]
+            if parts.index('element') + 2 < len(parts): # attribute of element
+                return f"{el_name}.{parts[parts.index('element') + 2]}".lower().replace('_', '-')
+            return el_name.lower().replace('_', '-')
+        if 'global_attributes' in parts and parts.index('global_attributes') + 1 < len(parts):
+            return parts[parts.index('global_attributes') + 1].lower().replace('_', '-')
+    
+    # Fallback: last part of slug, normalized
+    # print(f"Warning: Using fallback normalization for slug '{slug}' -> '{parts[-1].lower().replace('_', '-')}'")
+    return parts[-1].lower().replace('_', '-')
+
+
+def _extract_links_from_tree_hrefs(node_list):
+    links = set()
+    nodes_to_visit = list(node_list)
+    while nodes_to_visit:
+        node = nodes_to_visit.pop(0)
+        if not isinstance(node, dict): continue
+        if node.get('type') == 'inline_link' and node.get('href'):
+            links.add(node.get('href'))
+        
+        for field_key in ["content", "children", "items"]: # Common fields holding more nodes
+            field_val = node.get(field_key)
+            if isinstance(field_val, list): nodes_to_visit.extend(field_val)
+            elif isinstance(field_val, dict): nodes_to_visit.append(field_val) # Single child node
+        # For tables
+        if node.get("type") == "table":
+            for header_cell_content in node.get("headers", []):
+                if isinstance(header_cell_content, list): nodes_to_visit.extend(header_cell_content)
+                elif isinstance(header_cell_content, dict): nodes_to_visit.append(header_cell_content)
+            for row in node.get("rows", []):
+                for cell_content in row:
+                    if isinstance(cell_content, list): nodes_to_visit.extend(cell_content)
+                    elif isinstance(cell_content, dict): nodes_to_visit.append(cell_content)
+    return list(links)
+
+
+def generate_relationship_map(all_parsed_pages_by_category, processed_bcd_data, navigation_data, output_dir):
+    relationship_map = {}
+    # Pass 1: Populate map from parsed pages
+    for category_name, pages_in_category in all_parsed_pages_by_category.items():
+        for page_object in pages_in_category:
+            slug = page_object['meta'].get('slug')
+            page_type = page_object['meta'].get('page-type')
+            file_path = page_object['path']
+            feature_key = _normalize_page_slug_to_feature_key(slug, page_type, file_path)
+            if not feature_key: continue
+
+            feature_entry = relationship_map.setdefault(feature_key, {
+                'titles': [], 'relatedDocPaths': {}, 'usedInPaths': [], 'macrosOnPage': [], '_internal': {}
+            })
+            if 'primaryDocPath' not in feature_entry or not page_object['meta'].get('noindex'): # Prefer non-noindex pages
+                feature_entry['primaryDocPath'] = file_path
+            page_title_meta = page_object['meta'].get('title')
+            if page_title_meta and page_title_meta not in feature_entry['titles']:
+                feature_entry['titles'].append(page_title_meta)
+            # Add H1 as title candidate
+            if page_object.get('tree') and page_object['tree'] and isinstance(page_object['tree'][0], dict) and page_object['tree'][0].get('type') == 'heading' and page_object['tree'][0].get('level') == 1:
+                h1_content_list = page_object['tree'][0].get('content', [])
+                h1_text = "".join(part if isinstance(part, str) else (part.get('content')[0] if isinstance(part.get('content'), list) and part.get('content') and isinstance(part.get('content')[0], str) else part.get('content',"") if isinstance(part.get('content'),str) else "") for part in h1_content_list if part).strip()
+                if h1_text and h1_text not in feature_entry['titles']: feature_entry['titles'].append(h1_text)
+
+            feature_entry['macrosOnPage'].extend(_extract_macros_from_tree(page_object.get('tree', [])))
+            if feature_key in processed_bcd_data: feature_entry['bcdPath'] = feature_key
+            feature_entry['_internal']['pageCategory'] = category_name
+            feature_entry['_internal']['sourceFilePath'] = file_path # Store original path for link resolution
+
+            for nav_entry in navigation_data:
+                normalized_nav_path = _normalize_page_slug_to_feature_key(nav_entry.get('path'))
+                if normalized_nav_path == feature_key or nav_entry.get('title') == page_title_meta:
+                    feature_entry['_internal']['sidebarCategoryPath'] = nav_entry.get('category_path')
+                    feature_entry['_internal']['sidebarFile'] = nav_entry.get('sidebar_file')
+                    break
+    
+    # Pass 2: Populate relatedDocPaths using sidebar data
+    for key, data in relationship_map.items():
+        sb_cat_path = data.get('_internal', {}).get('sidebarCategoryPath')
+        sb_file = data.get('_internal', {}).get('sidebarFile')
+        if sb_cat_path and sb_file:
+            for nav_entry in navigation_data:
+                if nav_entry.get('sidebar_file') == sb_file and nav_entry.get('category_path') == sb_cat_path and nav_entry.get('path'):
+                    related_key = _normalize_page_slug_to_feature_key(nav_entry.get('path'))
+                    if related_key and related_key != key and related_key in relationship_map:
+                        related_cat = relationship_map[related_key].get('_internal',{}).get('pageCategory', 'other')
+                        related_paths_for_cat = data['relatedDocPaths'].setdefault(related_cat, [])
+                        related_doc_path = relationship_map[related_key].get('primaryDocPath')
+                        if related_doc_path and related_doc_path not in related_paths_for_cat:
+                            related_paths_for_cat.append(related_doc_path)
+
+    # Pass 3: Cross-document analysis for usedInPaths and link-based relatedDocPaths
+    all_feature_keys = set(relationship_map.keys())
+    for category_name, pages_in_category in all_parsed_pages_by_category.items():
+        for source_page_object in pages_in_category:
+            source_slug = source_page_object['meta'].get('slug')
+            source_key = _normalize_page_slug_to_feature_key(source_slug, source_page_object['meta'].get('page-type'), source_page_object['path'])
+            if not source_key or source_key not in relationship_map: continue
+            
+            source_doc_path = relationship_map[source_key]['primaryDocPath']
+            
+            # Links from macros
+            for macro in relationship_map[source_key]['macrosOnPage']:
+                if macro['args']:
+                    # Heuristic: first arg is often a feature name or slug
+                    potential_target_slug = macro['args'][0]
+                    # Try to guess page type from macro name for better normalization
+                    target_page_type_hint = None
+                    if 'css' in macro['name'].lower(): target_page_type_hint = 'css-property'
+                    elif 'html' in macro['name'].lower() or 'element' in macro['name'].lower(): target_page_type_hint = 'html-element'
+                    # ... more hints
+                    
+                    target_key = _normalize_page_slug_to_feature_key(potential_target_slug, target_page_type_hint, source_page_object['path'])
+                    if target_key and target_key in all_feature_keys and target_key != source_key:
+                        if source_doc_path not in relationship_map[target_key]['usedInPaths']:
+                            relationship_map[target_key]['usedInPaths'].append(source_doc_path)
+            
+            # Links from hrefs
+            hrefs = _extract_links_from_tree_hrefs(source_page_object.get('tree', []))
+            for href in hrefs:
+                target_key = _resolve_link_href_to_feature_key(href, relationship_map, source_doc_path)
+                if target_key and target_key != source_key: # Already checked target_key in relationship_map
+                    if source_doc_path not in relationship_map[target_key]['usedInPaths']:
+                        relationship_map[target_key]['usedInPaths'].append(source_doc_path)
+                    # Add to source's relatedDocPaths
+                    target_cat = relationship_map[target_key].get('_internal', {}).get('pageCategory', 'other')
+                    source_related_paths_for_cat = relationship_map[source_key]['relatedDocPaths'].setdefault(target_cat, [])
+                    target_primary_path = relationship_map[target_key].get('primaryDocPath')
+                    if target_primary_path and target_primary_path not in source_related_paths_for_cat:
+                        source_related_paths_for_cat.append(target_primary_path)
+
+    for data in relationship_map.values(): # Cleanup internal data
+        if '_internal' in data: del data['_internal']
+        data['macrosOnPage'] = list({tuple(sorted(m.items())): m for m in data.get('macrosOnPage', [])}.values()) # Deduplicate macros
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, "generated_feature_relation_map.json")
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            json.dump(relationship_map, f, indent=2, ensure_ascii=False)
+        print(f"Successfully wrote relationship map to {output_filename}")
+    except Exception as e: print(f"Error writing relationship map to {output_filename}: {e}")
+    return relationship_map
+
+def _resolve_link_href_to_feature_key(href, relationship_map, current_page_primary_path=None):
+    if not href or href.startswith(('#', 'mailto:', 'tel:')) or '://' in href: return None
+    href_cleaned = href.split('?')[0].split('#')[0]
+    if href_cleaned.endswith(('.md', '.html')): href_cleaned = os.path.splitext(href_cleaned)[0]
+
+    # Try direct slug normalization (common for MDN links like /en-US/docs/Web/CSS/color)
+    # The slug often appears after /docs/
+    normalized_key_from_href = None
+    if '/docs/' in href_cleaned:
+        slug_part = href_cleaned.split('/docs/', 1)[-1]
+        normalized_key_from_href = _normalize_page_slug_to_feature_key(slug_part, file_path=current_page_primary_path or "") # Pass context
+    else: # If not a full /docs/ path, try normalizing the whole thing (might be relative or just a slug)
+        normalized_key_from_href = _normalize_page_slug_to_feature_key(href_cleaned, file_path=current_page_primary_path or "")
+
+    if normalized_key_from_href and normalized_key_from_href in relationship_map:
+        return normalized_key_from_href
+
+    # Attempt to match against primaryDocPath (more complex, needs careful path handling)
+    # This is a simplified check. A robust solution would involve proper path resolution
+    # and matching against a map of all primaryDocPaths to their keys.
+    if current_page_primary_path and href_cleaned.startswith('.'): # Relative path
+        try:
+            # Construct an absolute-like path relative to the MDN content root structure
+            # This needs to be consistent with how primaryDocPath is stored.
+            # Example: current_page_primary_path = "files/en-us/web/html/element/a/index.md"
+            # href_cleaned = "../foo/bar" -> resolved_path = "files/en-us/web/html/foo/bar"
+            base_dir = os.path.dirname(current_page_primary_path)
+            resolved_path_candidate = os.path.normpath(os.path.join(base_dir, href_cleaned)).replace(os.sep, '/')
+            
+            for key, data in relationship_map.items():
+                # Compare resolved_path_candidate with data.get('primaryDocPath')
+                # This comparison needs to be smart about 'index' files and extensions.
+                # For now, a direct match or match without 'index'
+                primary_doc = data.get('primaryDocPath')
+                if primary_doc:
+                    if primary_doc == resolved_path_candidate or \
+                       primary_doc == resolved_path_candidate + '/index' or \
+                       primary_doc.replace('/index.md', '') == resolved_path_candidate or \
+                       primary_doc.replace('.md', '') == resolved_path_candidate:
+                        return key
+        except Exception as e:
+            # print(f"Path resolution error for relative link '{href}': {e}")
+            pass
+    return None
+
+
+# --- Search Index Generation ---
+def generate_search_index(relationship_map_data, all_parsed_pages_by_category, output_dir):
+    print("Generating search index...")
+    search_index = []
+    for key, feature_data in relationship_map_data.items():
+        title = feature_data.get('titles', [key])[0] if feature_data.get('titles') else key
+        path = feature_data.get('primaryDocPath', '')
+        
+        summary = ""
+        keywords = set([key, title] + title.lower().split()) # Basic keywords
+
+        # Try to get a summary from the first paragraph of the primary doc
+        if path:
+            page_object = None
+            for category_pages in all_parsed_pages_by_category.values():
+                found_page = next((p for p in category_pages if p['path'] == path), None)
+                if found_page:
+                    page_object = found_page
+                    break
+            
+            if page_object and page_object.get('tree'):
+                for node in page_object['tree']:
+                    if node.get('type') == 'paragraph':
+                        # Extract text from paragraph content (which can be mixed list)
+                        current_summary_parts = []
+                        if isinstance(node.get('content'), list):
+                            for part in node['content']:
+                                if isinstance(part, str): current_summary_parts.append(part)
+                                elif isinstance(part, dict) and isinstance(part.get('content'), str): # e.g. inline_bold
+                                    current_summary_parts.append(part['content'])
+                        elif isinstance(node.get('content'), str):
+                             current_summary_parts.append(node['content'])
+                        
+                        summary = " ".join(current_summary_parts).strip()
+                        if summary:
+                            summary = (summary[:200] + '...') if len(summary) > 200 else summary
+                            # Add words from summary to keywords
+                            keywords.update(re.findall(r'\b\w{3,}\b', summary.lower())) # Words of 3+ chars
+                            break # Found first paragraph
+        
+        search_index.append({
+            "key": key,
+            "title": title,
+            "path": path,
+            "summary": summary,
+            "keywords": sorted(list(k for k in keywords if k)) # Remove empty strings and sort
+        })
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, "generated_search_index.json")
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            json.dump(search_index, f, indent=2, ensure_ascii=False)
+        print(f"Successfully wrote search index to {output_filename}")
+    except Exception as e:
+        print(f"Error writing search index to {output_filename}: {e}")
+    return search_index
+
+# --- Template/Macro Resolver Map Generation ---
+def generate_macro_resolver_map(all_parsed_pages_by_category, output_dir):
+    print("Generating macro resolver map...")
+    unique_macros = {} # Key: macro_name, Value: { "name": macro_name, "arg_patterns": set(), "renderTypeHint": "unknown" }
+
+    for category_pages in all_parsed_pages_by_category.values():
+        for page_object in category_pages:
+            macros_on_page = _extract_macros_from_tree(page_object.get('tree', []))
+            for macro in macros_on_page:
+                name = macro.get("name")
+                args = macro.get("args", [])
+                if name:
+                    if name not in unique_macros:
+                        unique_macros[name] = {"name": name, "arg_patterns": set(), "renderTypeHint": "unknown", "example_args": []}
+                    
+                    # Store a pattern of argument counts
+                    unique_macros[name]["arg_patterns"].add(len(args))
+                    if len(unique_macros[name]["example_args"]) < 5 : # Store a few examples
+                        unique_macros[name]["example_args"].append(args)
+
+
+    # Convert sets to lists for JSON serialization
+    for name in unique_macros:
+        unique_macros[name]["arg_patterns"] = sorted(list(unique_macros[name]["arg_patterns"]))
+        # Add some predefined hints for common macros
+        if name.lower() in ["cssxref", "htmlattrxref", "htmlelement", "domxref", "svgattrxref", "svgelement", "eventref", "apiref", "jsxref"]:
+            unique_macros[name]["renderTypeHint"] = "link_to_feature"
+            unique_macros[name]["featureKeyArgIndex"] = 0 # Typically the first argument is the feature name
+        elif name.lower() == "embedlivesample":
+            unique_macros[name]["renderTypeHint"] = "embed_iframe"
+        elif name.lower() == "compat":
+            unique_macros[name]["renderTypeHint"] = "display_bcd"
+        elif name.lower() == "specifications":
+             unique_macros[name]["renderTypeHint"] = "display_spec_links"
+
+
+    os.makedirs(output_dir, exist_ok=True)
+    output_filename = os.path.join(output_dir, "generated_macro_resolver_map.json")
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            json.dump(unique_macros, f, indent=2, ensure_ascii=False)
+        print(f"Successfully wrote macro resolver map to {output_filename}")
+    except Exception as e:
+        print(f"Error writing macro resolver map to {output_filename}: {e}")
+    return unique_macros
+
+# --- Main Orchestration ---
+def process_mdn_content(content_repo_base_path, bcd_base_path, sidebars_base_path, output_dir):
+    print(f"--- Starting MDN Content Processing ---")
+    print(f"Content Repo Path: {content_repo_base_path}")
+    print(f"BCD Path: {bcd_base_path}")
+    print(f"Sidebars Path: {sidebars_base_path}")
+    print(f"Output Directory: {output_dir}")
+
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+
+    # 1. Load and Process BCD Data (and save it)
+    print("\n--- Phase 1: Processing Browser Compatibility Data (BCD) ---")
+    processed_bcd = load_and_process_bcd_data(bcd_base_path, output_dir) # Now saves inside
+    if not processed_bcd:
+        print("Error: BCD processing failed or yielded no data. Aborting.")
+        return
+
+    # 2. Load and Extract Sidebar/Navigation Data
+    print("\n--- Phase 2: Processing Sidebar/Navigation Data ---")
+    navigation_data = load_and_extract_sidebar_data(sidebars_base_path)
+    if not navigation_data:
+        print("Warning: Sidebar data processing yielded no data. Relationship map might be less complete.")
+
+    # 3. Generate Parsed Page Content JSONs (HTML, CSS, JS, etc.)
+    print("\n--- Phase 3: Parsing Markdown Page Content ---")
+    # content_repo_base_path for generate_parsed_content_json is usually like '.../files/en-us/'
+    all_parsed_pages_by_category = generate_parsed_content_json(content_repo_base_path, output_dir)
+    if not all_parsed_pages_by_category:
+        print("Error: Markdown page parsing failed or yielded no data. Aborting.")
+        return
+
+    # 4. Generate Relationship Map JSON
+    print("\n--- Phase 4: Generating Feature Relationship Map ---")
+    relationship_map = generate_relationship_map(
+        all_parsed_pages_by_category,
+        processed_bcd, # Use the loaded and processed BCD
+        navigation_data,
+        output_dir
+    )
+    if not relationship_map:
+        print("Error: Relationship map generation failed or yielded no data. Aborting.")
+        return
+
+    # 5. Generate Search Index JSON
+    print("\n--- Phase 5: Generating Search Index ---")
+    generate_search_index(relationship_map, all_parsed_pages_by_category, output_dir)
+
+    # 6. Generate Template/Macro Resolver Map JSON
+    print("\n--- Phase 6: Generating Macro Resolver Map ---")
+    generate_macro_resolver_map(all_parsed_pages_by_category, output_dir)
+
+    print("\n--- MDN Content Processing Complete ---")
+    print(f"All generated JSON files should be in: {output_dir}")
+
+
+if __name__ == "__main__":
+    print("MDN Data Processor - Starting Full Test Suite...")
+
+    # Define temporary base paths for test data
+    test_base_dir = "temp_mdn_processor_test_suite"
+    
+    # Clean up previous test run if any
+    if os.path.exists(test_base_dir):
+        shutil.rmtree(test_base_dir)
+    os.makedirs(test_base_dir, exist_ok=True)
+
+    # Setup directory structure similar to what the functions expect
+    # For content_repo_base_path, it's usually the 'en-us' level
+    mock_content_repo_path = os.path.join(test_base_dir, "mdn_content_root", "files", "en-us")
+    mock_bcd_path = os.path.join(test_base_dir, "bcd_data")
+    mock_sidebars_path = os.path.join(test_base_dir, "sidebar_data")
+    mock_output_dir = os.path.join(test_base_dir, "output_json")
+
+    os.makedirs(os.path.join(mock_content_repo_path, "web", "html"), exist_ok=True)
+    os.makedirs(os.path.join(mock_content_repo_path, "web", "css"), exist_ok=True)
+    os.makedirs(os.path.join(mock_content_repo_path, "web", "javascript"), exist_ok=True)
+    os.makedirs(os.path.join(mock_content_repo_path, "glossary"), exist_ok=True)
+    os.makedirs(mock_bcd_path, exist_ok=True)
+    os.makedirs(mock_sidebars_path, exist_ok=True)
+    os.makedirs(mock_output_dir, exist_ok=True)
+
+    print(f"\n--- Populating Mock MDN Content in: {mock_content_repo_path} ---")
+    # Sample HTML md file
+    html_md_content = """---
+title: Test HTML Page
+slug: Web/HTML/Test_Element
+page-type: html-element
+---
+# HTML Content
+This is an **HTML** test page about `Test_Element`.
+It links to a [CSS Property](../css/test_property.md) and uses {{cssxref("test_property")}}.
+Also see the {{HTMLElement("another-html-element")}}.
+"""
+    with open(os.path.join(mock_content_repo_path, "web", "html", "test_element.md"), "w", encoding='utf-8') as f:
+        f.write(html_md_content)
+
+    html_another_content = """---
+title: Another HTML Element
+slug: Web/HTML/Element/another-html-element
+page-type: html-element
+---
+# Another Element
+Content for another element.
+"""
+    with open(os.path.join(mock_content_repo_path, "web", "html", "another_element.md"), "w", encoding='utf-8') as f:
+        f.write(html_another_content)
+
+
+    # Sample CSS md file
+    css_md_content = """---
+title: Test CSS Property
+slug: Web/CSS/test_property
+page-type: css-property
+---
+# CSS Content
+This is a `CSS` test page for `test_property`.
+It mentions the {{HTMLElement("Test_Element")}}.
+"""
+    with open(os.path.join(mock_content_repo_path, "web", "css", "test_property.md"), "w", encoding='utf-8') as f:
+        f.write(css_md_content)
+
+    # Sample JS md file
+    js_md_content = """---
+title: Test JS API
+slug: Web/JavaScript/Reference/Global_Objects/TestAPI
+page-type: javascript-class
+---
+# JS Content
+A {{JSGlobalClass("TestAPI")}} example.
+With a method {{jsxref("TestAPI.prototype.methodA", "methodA")}}.
+"""
+    with open(os.path.join(mock_content_repo_path, "web", "javascript", "test_api.md"), "w", encoding='utf-8') as f:
+        f.write(js_md_content)
+
+    print(f"\n--- Populating Mock BCD Data in: {mock_bcd_path} ---")
+    sample_api_bcd = {"TestAPI": {"__compat": {"mdn_url": "/docs/Web/JavaScript/Reference/Global_Objects/TestAPI"}}}
+    with open(os.path.join(mock_bcd_path, "api.json"), "w") as f: json.dump(sample_api_bcd, f) # JS uses api.json for classes
+    
+    sample_html_bcd = {"elements": {"test_element": {"__compat": {"mdn_url": "/docs/Web/HTML/Test_Element"}}}}
+    with open(os.path.join(mock_bcd_path, "html.json"), "w") as f: json.dump(sample_html_bcd, f)
+    
+    sample_css_bcd = {"properties": {"test_property": {"__compat": {"mdn_url": "/docs/Web/CSS/test_property"}}}}
+    with open(os.path.join(mock_bcd_path, "css.json"), "w") as f: json.dump(sample_css_bcd, f)
+
+
+    print(f"\n--- Populating Mock Sidebar Data in: {mock_sidebars_path} ---")
+    sample_main_sidebar = {
+        "items": [
+            {"title": "HTML Section", "children": [
+                {"title": "Test HTML Page", "slug": "Web/HTML/Test_Element"},
+                {"title": "Another HTML Page", "slug": "Web/HTML/Element/another-html-element"}
+            ]},
+            {"title": "CSS Section", "children": [
+                {"title": "Test CSS Property", "slug": "Web/CSS/test_property"}
+            ]},
+            {"title": "JS Section", "children": [
+                {"title": "Test JS API", "slug": "Web/JavaScript/Reference/Global_Objects/TestAPI"}
+            ]}
+        ]
+    }
+    with open(os.path.join(mock_sidebars_path, "main_sidebar.yaml"), "w", encoding='utf-8') as f:
+        yaml.dump(sample_main_sidebar, f)
+
+    # --- Run the main processing function ---
+    process_mdn_content(
+        content_repo_base_path=mock_content_repo_path,
+        bcd_base_path=mock_bcd_path,
+        sidebars_base_path=mock_sidebars_path,
+        output_dir=mock_output_dir
+    )
+
+    # --- Basic Verification of Output Files ---
+    print("\n--- Verifying Output Files ---")
+    expected_files = [
+        "generated_parsed_html_content.json",
+        "generated_parsed_css_content.json",
+        "generated_parsed_javascript_content.json",
+        "generated_bcd_processed.json",
+        "generated_feature_relation_map.json",
+        "generated_search_index.json",
+        "generated_macro_resolver_map.json"
+    ]
+    for f_name in expected_files:
+        f_path = os.path.join(mock_output_dir, f_name)
+        if os.path.exists(f_path) and os.path.getsize(f_path) > 2: # Check if exists and not empty (e.g. just '[]' or '{}')
+            print(f"✅ Found: {f_name} (size: {os.path.getsize(f_path)} bytes)")
+            # Optionally load and print a snippet
+            # if f_name == "generated_feature_relation_map.json":
+            #     with open(f_path, 'r') as f_content:
+            #         map_data_sample = json.load(f_content)
+            #         print("Sample from relation_map:", list(map_data_sample.keys())[:3])
+        else:
+            print(f"❌ Missing or empty: {f_name}")
+
+    # Consider adding more specific content verification for each generated JSON
+    
+    # print(f"\n--- Test Suite Finished. Check logs and '{mock_output_dir}' for generated files. ---")
+    # print(f"To clean up, delete the directory: {test_base_dir}")
+
